@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 )
@@ -42,6 +44,16 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatal(err)
 	}
+
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		for range ticker.C {
+			_, err := pool.Exec(ctx, "delete from idempotency_key where created_at < now() - interval '24 hours'")
+			if err != nil {
+				log.Println(err)
+			}
+		}
+	}()
 
 	fmt.Println("Listening on port 8080")
 	http.ListenAndServe(":8080", mux)
@@ -133,6 +145,12 @@ func transferMoney(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		http.Error(w, "Idempotency-Key header is required", http.StatusBadRequest)
+		return
+	}
+
 	tx, err := pool.Begin(r.Context())
 	if err != nil {
 		log.Println(err)
@@ -140,6 +158,37 @@ func transferMoney(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+
+	_, err = tx.Exec(r.Context(), "insert into idempotency_key (key, from_id, to_id, amount) values ($1, $2, $3, $4)", key, req.From, req.To, req.Amount)
+	if err != nil {
+
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+			log.Println(err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+
+		var savedFrom int64
+		var savedTo int64
+		var savedAmount int64
+		err = pool.QueryRow(r.Context(), "select from_id, to_id, amount from idempotency_key where key = $1", key).Scan(&savedFrom, &savedTo, &savedAmount)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if savedFrom != req.From || savedTo != req.To || savedAmount != req.Amount {
+			http.Error(w, "Idempotency key was used with a different request", http.StatusUnprocessableEntity)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("transfer successful"))
+		return
+
+	}
 
 	_, err = tx.Exec(r.Context(), "select 1 from account where id=$1 for update", min(req.From, req.To))
 	if err != nil {
